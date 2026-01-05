@@ -13,7 +13,7 @@
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use crate::Layer;
@@ -21,7 +21,7 @@ use crate::configuration::Configuration;
 use crate::device::AbstractDevice;
 use crate::error::{Error, Result};
 use crate::windows::AbstractDeviceExt;
-use windows_sys::Win32::NetworkManagement::IpHelper::SetIpInterfaceEntry;
+use windows_sys::Win32::NetworkManagement::IpHelper::{SetIpInterfaceEntry, self};
 use wintun_bindings::{Adapter, MAX_RING_CAPACITY, Session, load_from_path};
 
 /// A TUN device using the wintun driver.
@@ -145,10 +145,14 @@ impl AbstractDevice for Device {
     }
 
     fn set_address(&mut self, value: IpAddr) -> Result<()> {
-        let IpAddr::V4(value) = value else {
-            unimplemented!("do not support IPv6 yet")
-        };
-        Ok(self.tun.session.get_adapter().set_address(value)?)
+        match value {
+            IpAddr::V4(value) => {
+                Ok(self.tun.session.get_adapter().set_address(value)?)
+            }
+            IpAddr::V6(value) => {
+                set_interface_address_mask_ipv6(self.tun_luid(), value, None)
+            }
+        }
     }
 
     fn destination(&self) -> Result<IpAddr> {
@@ -312,6 +316,24 @@ impl Write for Writer {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+fn set_interface_address_mask_ipv6(luid: u64, address: Ipv6Addr, mask: Option<Ipv6Addr>) -> Result<()> {
+    use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    use windows_sys::Win32::Networking::WinSock::AF_INET6;
+    let luid = NET_LUID_LH { Value: luid };
+    let family = AF_INET6;
+    let mut row = IpHelper::MIB_UNICASTIPADDRESS_ROW::default();
+    unsafe { IpHelper::InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceLuid.Value = unsafe { luid.Value };
+    row.Address.si_family = family;
+    row.Address.Ipv6.sin6_addr.u.Byte = address.octets();
+    row.OnLinkPrefixLength = match mask {
+        Some(mask) => u128::from_be_bytes(mask.octets()).leading_ones() as u8,
+        None => 64,
+    };
+    unsafe { IpHelper::CreateUnicastIpAddressEntry(&row) };
+    Ok(())
 }
 
 fn set_interface_metric(luid: u64, metric: u32, ipv6: bool) -> io::Result<()> {
